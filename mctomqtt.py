@@ -80,11 +80,45 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+class MeshCoreBridgeManager:
+
+    def __init__(self, debug=False):
+        self.debug = debug
+        self.port_count = len(os.getenv(f"MCTOMQTT_SERIAL_PORTS", "/dev/ttyACM0").split(","))
+        self.bridges = []
+        self.should_exit = False
+
+        logger.info("Initialised MeshCoreBridgeManager")
+
+    def run(self):
+            
+            for port_num in range(self.port_count):
+                bridge = MeshCoreBridge(debug=args.debug)
+                bridge.run()
+                self.bridges.append(bridge)
+
+            logger.info(f"Executing with {len(self.bridges)} bridges")
+
+            try:
+                while True:
+                    if self.should_exit:
+                        sys.exit(-1)
+                    sleep(0.5)
+                    
+            except KeyboardInterrupt:
+                logger.info("\nExiting...")
+                for bridge in self.bridges:
+                    try:
+                        bridge.should_exit = True
+                    except:
+                        pass
+
 class MeshCoreBridge:
     last_raw: bytes = None
 
     def __init__(self, debug=False):
         self.debug = debug
+        self.port_number = 0
         self.repeater_name = None
         self.repeater_pub_key = None
         self.repeater_priv_key = None
@@ -214,32 +248,39 @@ class MeshCoreBridge:
             password = self.get_env(f"MQTT{broker_num}_PASSWORD", "")
             return username, password
 
-    def connect_serial(self):
+    def connect_serial(self, portNumber):
         ports = self.get_env("SERIAL_PORTS", "/dev/ttyACM0").split(",")
         baud_rate = self.get_env_int("SERIAL_BAUD_RATE", 115200)
         timeout = self.get_env_int("SERIAL_TIMEOUT", 2)
 
-        for port in ports:
-            try:
-                self.ser = serial.Serial(
-                    port=port,
-                    baudrate=baud_rate,
-                    parity=serial.PARITY_NONE,
-                    stopbits=serial.STOPBITS_ONE,
-                    bytesize=serial.EIGHTBITS,
-                    timeout=timeout,
-                    rtscts=False
-                )
-                self.ser.write(b"\r\n\r\n")
-                self.ser.flushInput()
-                self.ser.flushOutput()
-                logger.info(f"Connected to {port}")
-                return True
-            except (serial.SerialException, OSError) as e:
-                logger.warning(f"Failed to connect to {port}: {str(e)}")
-                continue
-        logger.error("Failed to connect to any serial port")
-        return False
+        if portNumber is not None:
+            if portNumber < 0 or portNumber >= len(ports):
+                logger.error(f"Invalid port number {portNumber}, available ports are 0 to {len(ports)-1}")
+                return False
+
+            port = ports[portNumber]
+        else:
+            logger.debug("Using default serial port 0")
+            port = ports[0]
+            
+        try:
+            self.ser = serial.Serial(
+                port=port,
+                baudrate=baud_rate,
+                parity=serial.PARITY_NONE,
+                stopbits=serial.STOPBITS_ONE,
+                bytesize=serial.EIGHTBITS,
+                timeout=timeout,
+                rtscts=False
+            )
+            self.ser.write(b"\r\n\r\n")
+            self.ser.flushInput()
+            self.ser.flushOutput()
+            logger.info(f"Connected to {port}")
+            return True
+        except (serial.SerialException, OSError) as e:
+            logger.warning(f"Failed to connect to {port}: {str(e)}")
+            return False
 
     def set_repeater_time(self):
         self.ser.flushInput()
@@ -761,7 +802,7 @@ class MeshCoreBridge:
             return
 
     def run(self):
-        if not self.connect_serial():
+        if not self.connect_serial(self.port_number):
             return
 
         self.set_repeater_time()
@@ -825,7 +866,7 @@ class MeshCoreBridge:
                         self.parse_and_publish(line)
                 except OSError:
                    logger.warning("Serial connection unavailable, trying to reconnect")
-                   self.connect_serial()
+                   self.connect_serial(self.port_number)
                    sleep(0.5)
                 sleep(0.01)
                 
@@ -846,5 +887,5 @@ if __name__ == "__main__":
     if args.debug:
         logger.setLevel(logging.DEBUG)
 
-    bridge = MeshCoreBridge(debug=args.debug)
-    bridge.run()
+    manager = MeshCoreBridgeManager(debug=args.debug)
+    manager.run()
