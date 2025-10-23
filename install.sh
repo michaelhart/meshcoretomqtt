@@ -4,7 +4,7 @@
 # ============================================================================
 set -e
 
-SCRIPT_VERSION="1.0.3"
+SCRIPT_VERSION="1.0.4"
 DEFAULT_REPO="Cisien/meshcoretomqtt"
 DEFAULT_BRANCH="main"
 

@@ -436,6 +436,8 @@ class MeshCoreBridge:
         if "-> " in response:
             board_type = response.split("-> ", 1)[1]
             board_type = board_type.split('\n')[0].replace('\r', '').strip()
+            if board_type == "Unknown command":
+                board_type = "unknown"
             logger.info(f"Board type: {board_type}")
             return board_type
         
@@ -472,11 +474,13 @@ class MeshCoreBridge:
                 logger.error(f"MQTT connection failed for {broker_name}: Not authorized - token will be regenerated on next reconnect")
                 # Clear the cached token to force regeneration on next attempt
                 if broker_num in self.token_cache:
+                    logger.info(f"MQTT{broker_num}: Clearing cached token due to auth failure")
                     del self.token_cache[broker_num]
                 # Mark the client info for recreation
                 for mqtt_info in self.mqtt_clients:
                     if mqtt_info['broker_num'] == broker_num:
                         mqtt_info['needs_recreate'] = True
+                        logger.info(f"MQTT{broker_num}: Marked for recreation with fresh token")
                         break
             else:
                 logger.error(f"MQTT connection failed for {broker_name} with code {rc}")
@@ -692,35 +696,41 @@ class MeshCoreBridge:
             
             broker_num = mqtt_info['broker_num']
             
-            # Check if client needs to be recreated (auth failure means we need fresh token)
-            if mqtt_info.get('needs_recreate', False):
-                logger.warning(f"MQTT{broker_num}: Recreating client with fresh token after auth failure")
-                
-                try:
-                    # Stop the old client
-                    old_client = mqtt_info['client']
-                    try:
-                        old_client.loop_stop()
-                        old_client.disconnect()
-                    except:
-                        pass
+            # Check if using auth tokens and if token is expired or close to expiring
+            use_auth_token = self.get_env_bool(f"MQTT{broker_num}_USE_AUTH_TOKEN", False)
+            if use_auth_token and broker_num in self.token_cache:
+                cached_token, created_at = self.token_cache[broker_num]
+                token_age = current_time - created_at
+                if token_age > (self.token_ttl - 300):
+                    logger.warning(f"MQTT{broker_num}: Token expired or near expiry (age: {token_age:.0f}s), recreating client")
                     
-                    # Create a new client with fresh credentials (token already cleared from cache)
-                    new_client_info = self.connect_mqtt_broker(broker_num)
-                    if new_client_info:
-                        self.mqtt_clients[i] = new_client_info
-                        logger.info(f"MQTT{broker_num}: Successfully recreated client with fresh token")
-                    else:
-                        logger.error(f"MQTT{broker_num}: Failed to recreate client")
+                    try:
+                        # Stop the old client
+                        old_client = mqtt_info['client']
+                        try:
+                            old_client.loop_stop()
+                            old_client.disconnect()
+                        except:
+                            pass
+                        
+                        # Clear cached token
+                        del self.token_cache[broker_num]
+                        
+                        # Create new client with fresh token
+                        new_client_info = self.connect_mqtt_broker(broker_num)
+                        if new_client_info:
+                            self.mqtt_clients[i] = new_client_info
+                            logger.info(f"MQTT{broker_num}: Successfully recreated client with fresh token")
+                        else:
+                            logger.error(f"MQTT{broker_num}: Failed to recreate client")
+                            mqtt_info['reconnect_at'] = current_time + self.reconnect_delay
+                            self.reconnect_delay = min(self.reconnect_delay * self.reconnect_backoff, self.max_reconnect_delay)
+                    except Exception as e:
+                        logger.error(f"MQTT{broker_num}: Error recreating client: {e}")
                         mqtt_info['reconnect_at'] = current_time + self.reconnect_delay
                         self.reconnect_delay = min(self.reconnect_delay * self.reconnect_backoff, self.max_reconnect_delay)
                     
-                except Exception as e:
-                    logger.error(f"MQTT{broker_num}: Error recreating client: {e}")
-                    mqtt_info['reconnect_at'] = current_time + self.reconnect_delay
-                    self.reconnect_delay = min(self.reconnect_delay * self.reconnect_backoff, self.max_reconnect_delay)
-                
-                continue
+                    continue
             
             # Normal reconnect attempt
             try:
