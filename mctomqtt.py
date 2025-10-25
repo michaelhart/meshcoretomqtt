@@ -52,16 +52,40 @@ def load_env_files():
     # Load .env first (defaults)
     env_vars = parse_env_file(env_file)
     
-    # Load .env.local (overrides)
+    # Load .env.local (overrides) - these ALWAYS take precedence
     local_vars = parse_env_file(env_local_file)
     env_vars.update(local_vars)
     
-    # Set environment variables
+    # Set environment variables - .env.local ALWAYS overrides existing environment
+    # This ensures Docker -e flags or shell exports don't take precedence over config files
     for key, value in env_vars.items():
-        if key not in os.environ:
-            os.environ[key] = value
+        os.environ[key] = value
     
     return env_vars
+
+def log_config_sources():
+    """Log configuration file sources and contents for debugging"""
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+    env_file = os.path.join(script_dir, '.env')
+    env_local_file = os.path.join(script_dir, '.env.local')
+    
+    logger.info(f"Config directory: {script_dir}")
+    logger.info(f".env file: {env_file} (exists: {os.path.exists(env_file)})")
+    logger.info(f".env.local file: {env_local_file} (exists: {os.path.exists(env_local_file)})")
+    
+    if not os.path.exists(env_local_file):
+        logger.warning(".env.local file not found - using defaults from .env only")
+    else:
+        logger.info("=== .env.local configuration ===")
+        try:
+            with open(env_local_file, 'r') as f:
+                for line in f:
+                    line = line.rstrip()
+                    if line and not line.startswith('#'):
+                        logger.info(f"  {line}")
+        except Exception as e:
+            logger.error(f"Error reading .env.local: {e}")
+        logger.info("================================")
 
 # Load environment configuration
 load_env_files()
@@ -627,6 +651,21 @@ class MeshCoreBridge:
 
     def connect_mqtt(self):
         """Connect to all configured MQTT brokers and wait for all to complete initial connection"""
+        # Log MQTT broker configuration for debugging
+        logger.info("=== MQTT Broker Configuration ===")
+        for broker_num in range(1, 5):
+            enabled = self.get_env_bool(f"MQTT{broker_num}_ENABLED", False)
+            if enabled:
+                server = self.get_env(f"MQTT{broker_num}_SERVER", "")
+                port = self.get_env_int(f"MQTT{broker_num}_PORT", 1883)
+                transport = self.get_env(f"MQTT{broker_num}_TRANSPORT", "tcp")
+                use_tls = self.get_env_bool(f"MQTT{broker_num}_USE_TLS", False)
+                use_auth_token = self.get_env_bool(f"MQTT{broker_num}_USE_AUTH_TOKEN", False)
+                logger.info(f"MQTT{broker_num}: ENABLED - {server}:{port} (transport={transport}, tls={use_tls}, auth_token={use_auth_token})")
+            else:
+                logger.info(f"MQTT{broker_num}: DISABLED")
+        logger.info("=================================")
+        
         # Try to connect to MQTT1, MQTT2, MQTT3, MQTT4 (can expand if needed)
         for broker_num in range(1, 5):
             # Create an event for this broker to signal connection completion
@@ -789,6 +828,9 @@ class MeshCoreBridge:
             return
 
     def run(self):
+        # Log configuration sources at startup
+        log_config_sources()
+        
         if not self.connect_serial():
             return
 
