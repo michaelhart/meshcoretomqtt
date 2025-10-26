@@ -9,6 +9,7 @@ import re
 import time
 import calendar
 import logging
+import signal
 from datetime import datetime
 from time import sleep
 from auth_token import create_auth_token, read_private_key_file
@@ -223,6 +224,9 @@ class MeshCoreBridge:
 
         for port in ports:
             try:
+                # Close any existing serial handle before creating a new one
+                self.close_serial()
+
                 self.ser = serial.Serial(
                     port=port,
                     baudrate=baud_rate,
@@ -242,6 +246,19 @@ class MeshCoreBridge:
                 continue
         logger.error("Failed to connect to any serial port")
         return False
+
+    def close_serial(self):
+        """Close and clear the current serial handle if present."""
+        try:
+            if self.ser:
+                try:
+                    if getattr(self.ser, "is_open", False):
+                        logger.debug("Closing serial connection")
+                        self.ser.close()
+                except Exception:
+                    pass
+        finally:
+            self.ser = None
 
     def set_repeater_time(self):
         if not self.ser:
@@ -792,6 +809,11 @@ class MeshCoreBridge:
                 self.safe_publish(packets_topic, json.dumps(message))
             return
 
+    def handle_signal(self, signum, frame):
+        """Signal handler to trigger graceful shutdown."""
+        logger.info(f"Received signal {signum}, shutting down...")
+        self.should_exit = True
+
     def run(self):
         if not self.connect_serial():
             return
@@ -847,32 +869,39 @@ class MeshCoreBridge:
         try:
             while True:
                 if self.should_exit:
-                    sys.exit(-1)
+                    break
                 
                 # Check and reconnect any disconnected brokers
                 self.reconnect_disconnected_brokers()
                 
                 try:
                     # Check for serial data
-                    if self.ser.in_waiting > 0:
+                    if self.ser and self.ser.in_waiting > 0:
                         line = self.ser.readline().decode(errors='replace').strip()
                         logger.debug(f"RX: {line}")
                         self.parse_and_publish(line)
                 except OSError:
-                   logger.warning("Serial connection unavailable, trying to reconnect")
-                   self.connect_serial()
-                   sleep(0.5)
+                    logger.warning("Serial connection unavailable, trying to reconnect")
+                    self.close_serial()
+                    self.connect_serial()
+                    sleep(0.5)
                 sleep(0.01)
                 
         except KeyboardInterrupt:
             logger.info("\nExiting...")
+        except Exception as e:
+            logger.exception(f"Unhandled error in main loop: {e}")
+        finally:
+            # Cleanup MQTT clients
             for mqtt_client_info in self.mqtt_clients:
                 try:
+                    mqtt_client_info['client'].loop_stop()
                     mqtt_client_info['client'].disconnect()
                 except:
                     pass
-            if self.ser:
-                self.ser.close()
+            
+            # Close serial connection
+            self.close_serial()
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
@@ -883,4 +912,9 @@ if __name__ == "__main__":
         logger.setLevel(logging.DEBUG)
 
     bridge = MeshCoreBridge(debug=args.debug)
+
+    # Ensure signals from systemd (SIGTERM) and ctrl-c (SIGINT) are handled
+    signal.signal(signal.SIGTERM, bridge.handle_signal)
+    signal.signal(signal.SIGINT, bridge.handle_signal)
+
     bridge.run()
