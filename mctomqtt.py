@@ -10,6 +10,7 @@ import time
 import calendar
 import logging
 import random
+import subprocess
 from datetime import datetime
 from time import sleep
 from auth_token import create_auth_token, read_private_key_file
@@ -135,7 +136,8 @@ class MeshCoreBridge:
         self.token_cache = {}  # Cache tokens with their creation time
         self.token_ttl = 3600  # 1 hour token TTL
         self.ws_ping_threads = {}  # Track WebSocket ping threads per broker
-        
+        self.sync_time_at_start = self.get_env(f"MCTOMQTT_SYNC_TIME", True) # issues a command to sync the pi's clock at script start
+
         # Statistics tracking
         self.stats = {
             'start_time': time.time(),
@@ -1214,13 +1216,32 @@ class MeshCoreBridge:
                 self.safe_publish(packets_topic, json.dumps(message))
             return
 
+    def wait_for_system_time_sync(self):
+        while True:
+            result = subprocess.run(
+                ['journalctl', '-u', 'systemd-timesyncd'],
+                capture_output=True,
+                text=True,
+                timeout=10
+            )
+
+            if "Initial clock synchronization" in result.stdout:
+                return
+            else:
+                logger.warning("System clock is not synchronized")
+
+            time.sleep(1)
+
+
     def run(self):
         log_config_sources()
         
         if not self.connect_serial():
             return
 
-        self.set_repeater_time()
+        if self.sync_time_at_start:
+            self.wait_for_system_time_sync()
+            self.set_repeater_time()
 
         if not self.get_repeater_name():
             logger.error("Failed to get repeater name")
