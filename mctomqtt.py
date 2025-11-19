@@ -137,7 +137,7 @@ class MeshCoreBridge:
         self.token_cache = {}  # Cache tokens with their creation time
         self.token_ttl = 3600  # 1 hour token TTL
         self.ws_ping_threads = {}  # Track WebSocket ping threads per broker
-        self.sync_time_at_start = self.get_env(f"MCTOMQTT_SYNC_TIME", True) # issues a command to sync the pi's clock at script start
+        self.sync_time_at_start = self.get_env_bool('SYNC_TIME', True) # issues a command to sync the pi's clock at script start
 
         # Statistics tracking
         self.stats = {
