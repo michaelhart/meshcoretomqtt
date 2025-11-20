@@ -1243,20 +1243,23 @@ class MeshCoreBridge:
         self.should_exit = True
 
     def wait_for_system_time_sync(self):
-        while True:
+        attempts = 0
+        while attempts < 60 and not self.should_exit:
             result = subprocess.run(
-                ['journalctl', '-u', 'systemd-timesyncd'],
+                ['timedatectl', 'status'],
                 capture_output=True,
                 text=True,
                 timeout=10
             )
 
-            if "Initial clock synchronization" in result.stdout:
-                return
+            if "System clock synchronized: yes" in result.stdout:
+                return True
             else:
-                logger.warning("System clock is not synchronized")
+                logger.warning("System clock is not synchronized: %s",
+                        result.stderr)
 
             time.sleep(1)
+        return False
 
 
     def run(self):
@@ -1266,8 +1269,11 @@ class MeshCoreBridge:
             return
 
         if self.sync_time_at_start:
-            self.wait_for_system_time_sync()
-            self.set_repeater_time()
+            if self.wait_for_system_time_sync():
+                self.set_repeater_time()
+            else:
+                logger.error("Gave up waiting for system time sync,"
+                             " not setting repeater clock")
 
         if not self.get_repeater_name():
             logger.error("Failed to get repeater name")
