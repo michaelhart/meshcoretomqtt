@@ -1,4 +1,6 @@
 #!/usr/bin/env python3
+__version__ = "1.0.6.4"
+
 import sys
 import os
 import json
@@ -157,19 +159,20 @@ class MeshCoreBridge:
         logger.info("Configuration loaded from environment variables")
     
     def _load_client_version(self):
-        """Load client version from .version_info file"""
+        """Load client version from __version__ and optionally append git hash from .version_info"""
+        version = __version__
         try:
             script_dir = os.path.dirname(os.path.abspath(__file__))
             version_file = os.path.join(script_dir, '.version_info')
             if os.path.exists(version_file):
                 with open(version_file, 'r') as f:
                     version_data = json.load(f)
-                    installer_ver = version_data.get('installer_version', 'unknown')
-                    git_hash = version_data.get('git_hash', 'unknown')
-                    return f"meshcoretomqtt/{installer_ver}-{git_hash}"
+                    git_hash = version_data.get('git_hash', '')
+                    if git_hash and git_hash != 'unknown':
+                        return f"meshcoretomqtt/{version}-{git_hash}"
         except Exception as e:
             logger.debug(f"Could not load version info: {e}")
-        return "meshcoretomqtt/unknown"
+        return f"meshcoretomqtt/{version}"
     
     def get_env(self, key, fallback=''):
         """Get environment variable with fallback (all vars are MCTOMQTT_ prefixed)"""
@@ -1243,23 +1246,38 @@ class MeshCoreBridge:
         self.should_exit = True
 
     def wait_for_system_time_sync(self):
+        """
+        Wait up to 60 seconds for system clock synchronization via timedatectl.
+
+        Always returns True to allow the caller to proceed. If timedatectl is
+        unavailable (e.g., non-systemd systems) or any error occurs, logs a
+        warning and returns immediately. Respects should_exit for clean shutdown.
+        """
         attempts = 0
         while attempts < 60 and not self.should_exit:
-            result = subprocess.run(
-                ['timedatectl', 'status'],
-                capture_output=True,
-                text=True,
-                timeout=10
-            )
+            try:
+                result = subprocess.run(
+                    ['timedatectl', 'status'],
+                    capture_output=True,
+                    text=True,
+                    timeout=10
+                )
+            except FileNotFoundError:
+                logger.warning("timedatectl not found — skipping sync check and continuing.")
+                return True  # Don't loop 60 times
+            except Exception as e:
+                logger.warning("Error checking time sync (%s). Continuing.", e)
+                return True
 
             if "System clock synchronized: yes" in result.stdout:
                 return True
-            else:
-                logger.warning("System clock is not synchronized: %s",
-                        result.stderr)
-
+            logger.warning("System clock is not synchronized: %s",
+                           result.stderr.strip() or result.stdout.strip())
+            attempts += 1
             time.sleep(1)
-        return False
+
+        logger.warning("Timed out waiting for system clock sync — continuing anyway.")
+        return True
 
 
     def run(self):
@@ -1269,11 +1287,8 @@ class MeshCoreBridge:
             return
 
         if self.sync_time_at_start:
-            if self.wait_for_system_time_sync():
-                self.set_repeater_time()
-            else:
-                logger.error("Gave up waiting for system time sync,"
-                             " not setting repeater clock")
+            self.wait_for_system_time_sync()
+            self.set_repeater_time()
 
         if not self.get_repeater_name():
             logger.error("Failed to get repeater name")

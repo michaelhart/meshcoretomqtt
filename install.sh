@@ -4,7 +4,6 @@
 # ============================================================================
 set -e
 
-SCRIPT_VERSION="1.0.6.3"
 DEFAULT_REPO="Cisien/meshcoretomqtt"
 DEFAULT_BRANCH="main"
 
@@ -934,6 +933,25 @@ check_old_installation() {
 
 # Main installation function
 main() {
+    # Create temp directory for downloads
+    TMP_DIR=$(mktemp -d)
+    trap "rm -rf $TMP_DIR" EXIT
+    
+    # Download mctomqtt.py first to extract version
+    BASE_URL="https://raw.githubusercontent.com/$REPO/$BRANCH"
+    if [ -n "${LOCAL_INSTALL}" ]; then
+        cp "${LOCAL_INSTALL}/mctomqtt.py" "$TMP_DIR/mctomqtt.py"
+    else
+        curl -fsSL --retry 3 --retry-delay 2 "$BASE_URL/mctomqtt.py" -o "$TMP_DIR/mctomqtt.py" 2>/dev/null || {
+            print_error "Failed to download mctomqtt.py"
+            exit 1
+        }
+    fi
+    
+    # Extract version from mctomqtt.py
+    SCRIPT_VERSION=$(grep -E "^__version__\s*=" "$TMP_DIR/mctomqtt.py" | cut -d'"' -f2)
+    [ -z "$SCRIPT_VERSION" ] && SCRIPT_VERSION="unknown"
+    
     print_header "MeshCore to MQTT Installer v${SCRIPT_VERSION}"
     
     echo "This installer will help you set up MeshCore to MQTT relay."
@@ -949,13 +967,14 @@ main() {
     
     print_info "Installation directory: $INSTALL_DIR"
     
-    # Check if directory exists
+    # Check if functional installation exists (files + configured broker)
     UPDATING_EXISTING=false
-    if [ -d "$INSTALL_DIR" ]; then
+    if [ -f "$INSTALL_DIR/mctomqtt.py" ] && \
+       grep -qE "^MCTOMQTT_MQTT[0-9]_ENABLED=true" "$INSTALL_DIR/.env.local" 2>/dev/null; then
         if [ "$UPDATE_MODE" = true ]; then
             print_info "Update mode - updating existing installation..."
             UPDATING_EXISTING=true
-        elif prompt_yes_no "Directory already exists. Reinstall/update?" "y"; then
+        elif prompt_yes_no "Existing installation found. Update?" "y"; then
             print_info "Updating existing installation..."
             UPDATING_EXISTING=true
         else
@@ -972,42 +991,34 @@ main() {
     print_header "Installing Files"
     
     if [ -n "${LOCAL_INSTALL}" ]; then
-        # Local install for testing
+        # Local install for testing (mctomqtt.py already copied to TMP_DIR for version)
         print_info "Installing from local directory: ${LOCAL_INSTALL}"
-        cp "${LOCAL_INSTALL}/mctomqtt.py" "$INSTALL_DIR/"
-        cp "${LOCAL_INSTALL}/auth_token.py" "$INSTALL_DIR/"
-        cp "${LOCAL_INSTALL}/.env" "$INSTALL_DIR/"
-        cp "${LOCAL_INSTALL}/uninstall.sh" "$INSTALL_DIR/"
+        cp "${LOCAL_INSTALL}/auth_token.py" "$TMP_DIR/"
+        cp "${LOCAL_INSTALL}/.env" "$TMP_DIR/"
+        cp "${LOCAL_INSTALL}/uninstall.sh" "$TMP_DIR/"
         if [ -f "${LOCAL_INSTALL}/.env.local" ]; then
             print_warning ".env.local found in source - copying as .env.local.example"
             cp "${LOCAL_INSTALL}/.env.local" "$INSTALL_DIR/.env.local.example"
         fi
-        chmod +x "$INSTALL_DIR/mctomqtt.py"
-        chmod +x "$INSTALL_DIR/uninstall.sh"
         print_success "Files copied from local directory"
     else
-        # Download from GitHub
+        # Download remaining files from GitHub (mctomqtt.py already downloaded for version)
         print_info "Downloading from GitHub ($REPO @ $BRANCH)..."
-        BASE_URL="https://raw.githubusercontent.com/$REPO/$BRANCH"
-        TMP_DIR=$(mktemp -d)
-        trap "rm -rf $TMP_DIR" EXIT
-        
-        # Download all files
-        download_file "$BASE_URL/mctomqtt.py" "$TMP_DIR/mctomqtt.py" "mctomqtt.py" || exit 1
         download_file "$BASE_URL/auth_token.py" "$TMP_DIR/auth_token.py" "auth_token.py" || exit 1
         download_file "$BASE_URL/.env" "$TMP_DIR/.env" ".env" || exit 1
         download_file "$BASE_URL/uninstall.sh" "$TMP_DIR/uninstall.sh" "uninstall.sh" || exit 1
-        
-        # Verify and install
-        print_info "Verifying Python syntax..."
-        python3 -m py_compile "$TMP_DIR/mctomqtt.py" 2>/dev/null || { print_error "Syntax errors in mctomqtt.py"; exit 1; }
-        
-        # Move files (including hidden files like .env)
-        mv "$TMP_DIR"/* "$INSTALL_DIR/" 2>/dev/null || true
-        mv "$TMP_DIR"/.env "$INSTALL_DIR/" 2>/dev/null || true
-        chmod +x "$INSTALL_DIR/mctomqtt.py" "$INSTALL_DIR/uninstall.sh"
-        print_success "Files downloaded and verified"
+        print_success "Files downloaded"
     fi
+    
+    # Verify and install
+    print_info "Verifying Python syntax..."
+    python3 -m py_compile "$TMP_DIR/mctomqtt.py" 2>/dev/null || { print_error "Syntax errors in mctomqtt.py"; exit 1; }
+    
+    # Move files to install directory
+    mv "$TMP_DIR"/* "$INSTALL_DIR/" 2>/dev/null || true
+    mv "$TMP_DIR"/.env "$INSTALL_DIR/" 2>/dev/null || true
+    chmod +x "$INSTALL_DIR/mctomqtt.py" "$INSTALL_DIR/uninstall.sh"
+    print_success "Files installed"
     
     # Determine installation method first
     INSTALL_METHOD=""
@@ -1032,6 +1043,12 @@ main() {
         echo "  3) Manual run only (install files, no auto-start)"
         echo ""
         INSTALL_METHOD=$(prompt_input "Choose installation method [1-3]" "1")
+        
+        case "$INSTALL_METHOD" in
+            1) echo "$(detect_system_type_native)" > "$INSTALL_DIR/.install_type" ;;
+            2) echo "docker" > "$INSTALL_DIR/.install_type" ;;
+            3) echo "manual" > "$INSTALL_DIR/.install_type" ;;
+        esac
     fi
     
     # Docker containers include meshcore-decoder by default
@@ -1048,21 +1065,22 @@ main() {
         fi
         print_success "Python 3 found: $(python3 --version)"
         
-        # Set up virtual environment
+        # Set up virtual environment (verify deps work, recreate if broken)
         print_info "Setting up Python virtual environment..."
-        if [ ! -d "$INSTALL_DIR/venv" ]; then
+        if "$INSTALL_DIR/venv/bin/python3" -c "import serial, paho.mqtt.client" 2>/dev/null; then
+            print_success "Using existing virtual environment"
+        else
+            rm -rf "$INSTALL_DIR/venv" 2>/dev/null
             python3 -m venv "$INSTALL_DIR/venv"
             print_success "Virtual environment created"
-        else
-            print_success "Using existing virtual environment"
+            
+            # Install Python dependencies
+            print_info "Installing Python dependencies..."
+            source "$INSTALL_DIR/venv/bin/activate"
+            pip install --quiet --upgrade pip
+            pip install --quiet pyserial paho-mqtt
+            print_success "Python dependencies installed"
         fi
-        
-        # Install Python dependencies
-        print_info "Installing Python dependencies..."
-        source "$INSTALL_DIR/venv/bin/activate"
-        pip install --quiet --upgrade pip
-        pip install --quiet pyserial paho-mqtt
-        print_success "Python dependencies installed"
         
         # Check for meshcore-decoder (optional)
         DECODER_AVAILABLE=false
@@ -1296,9 +1314,6 @@ main() {
                 print_info "Skipping service installation"
                 print_info "To run manually: cd $INSTALL_DIR && ./venv/bin/python3 mctomqtt.py"
                 SERVICE_INSTALLED=false
-                
-                # Save installation type marker
-                echo "manual" > "$INSTALL_DIR/.install_type"
                 ;;
             *)
                 print_warning "Invalid selection, skipping service installation"
@@ -1494,9 +1509,6 @@ EOF
         fi
         
         SERVICE_INSTALLED=true
-        
-        # Save installation type marker
-        echo "systemd" > "$INSTALL_DIR/.install_type"
     else
         print_error "Failed to install service (sudo required)"
         SERVICE_INSTALLED=false
@@ -1557,9 +1569,6 @@ EOF
     
     SERVICE_INSTALLED=true
     print_success "Launchd service installed"
-    
-    # Save installation type marker
-    echo "launchd" > "$INSTALL_DIR/.install_type"
 }
 
 # Install Docker container
@@ -1646,9 +1655,6 @@ install_docker() {
     
     DOCKER_INSTALLED=true
     SERVICE_INSTALLED=false
-    
-    # Save installation type marker
-    echo "docker" > "$INSTALL_DIR/.install_type"
 }
 
 # Create version info file with installer version and git hash
