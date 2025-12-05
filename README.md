@@ -167,41 +167,41 @@ nano ~/.meshcoretomqtt/.env.local
 
 ```bash
 # Serial Configuration
-SERIAL_PORTS=/dev/ttyACM0
+MCTOMQTT_SERIAL_PORTS=/dev/ttyACM0
 
 # Global IATA Code (3-letter airport code for your location)
-IATA=SEA
+MCTOMQTT_IATA=SEA
 
 # MQTT Broker 1 - Username/Password
-MQTT1_ENABLED=true
-MQTT1_SERVER=mqtt.example.com
-MQTT1_PORT=1883
-MQTT1_USERNAME=my_username
-MQTT1_PASSWORD=my_password
+MCTOMQTT_MQTT1_ENABLED=true
+MCTOMQTT_MQTT1_SERVER=mqtt.example.com
+MCTOMQTT_MQTT1_PORT=1883
+MCTOMQTT_MQTT1_USERNAME=my_username
+MCTOMQTT_MQTT1_PASSWORD=my_password
 ```
 
 #### Advanced Example with Multiple Brokers
 
 ```bash
 # Serial Configuration
-SERIAL_PORTS=/dev/ttyACM0
-IATA=SEA
+MCTOMQTT_SERIAL_PORTS=/dev/ttyACM0
+MCTOMQTT_IATA=SEA
 
 # Broker 1 - Local MQTT with Username/Password
-MQTT1_ENABLED=true
-MQTT1_SERVER=mqtt.local
-MQTT1_PORT=1883
-MQTT1_USERNAME=localuser
-MQTT1_PASSWORD=localpass
+MCTOMQTT_MQTT1_ENABLED=true
+MCTOMQTT_MQTT1_SERVER=mqtt.local
+MCTOMQTT_MQTT1_PORT=1883
+MCTOMQTT_MQTT1_USERNAME=localuser
+MCTOMQTT_MQTT1_PASSWORD=localpass
 
 # Broker 2 - Public Observer Network with Auth Token
-MQTT2_ENABLED=true
-MQTT2_SERVER=mqtt-us-v1.letsmesh.net
-MQTT2_PORT=443
-MQTT2_TRANSPORT=websockets
-MQTT2_USE_TLS=true
-MQTT2_USE_AUTH_TOKEN=true
-MQTT2_TOKEN_AUDIENCE=mqtt-us-v1.letsmesh.net
+MCTOMQTT_MQTT2_ENABLED=true
+MCTOMQTT_MQTT2_SERVER=mqtt-us-v1.letsmesh.net
+MCTOMQTT_MQTT2_PORT=443
+MCTOMQTT_MQTT2_TRANSPORT=websockets
+MCTOMQTT_MQTT2_USE_TLS=true
+MCTOMQTT_MQTT2_USE_AUTH_TOKEN=true
+MCTOMQTT_MQTT2_TOKEN_AUDIENCE=mqtt-us-v1.letsmesh.net
 ```
 
 ### Topic Templates
@@ -214,19 +214,18 @@ Topics support template variables:
 **Global topics** (apply to all brokers by default):
 
 ```bash
-TOPIC_STATUS=meshcore/{IATA}/{PUBLIC_KEY}/status
-TOPIC_PACKETS=meshcore/{IATA}/{PUBLIC_KEY}/packets
-TOPIC_DEBUG=meshcore/{IATA}/{PUBLIC_KEY}/debug
-TOPIC_RAW=meshcore/{IATA}/{PUBLIC_KEY}/raw
+MCTOMQTT_TOPIC_STATUS=meshcore/{IATA}/{PUBLIC_KEY}/status
+MCTOMQTT_TOPIC_PACKETS=meshcore/{IATA}/{PUBLIC_KEY}/packets
+MCTOMQTT_TOPIC_DEBUG=meshcore/{IATA}/{PUBLIC_KEY}/debug
 ```
 
 **Per-broker topic overrides** (optional):
 
 ```bash
 # Broker 2 uses different topic structure
-MQTT2_TOPIC_STATUS=custom/{IATA}/{PUBLIC_KEY}/status
-MQTT2_TOPIC_PACKETS=custom/{IATA}/{PUBLIC_KEY}/data
-MQTT2_IATA=LAX  # Different IATA code for this broker
+MCTOMQTT_MQTT2_TOPIC_STATUS=custom/{IATA}/{PUBLIC_KEY}/status
+MCTOMQTT_MQTT2_TOPIC_PACKETS=custom/{IATA}/{PUBLIC_KEY}/data
+MCTOMQTT_MQTT2_IATA=LAX  # Different IATA code for this broker
 ```
 
 This allows sending the same data to multiple brokers with different topic
@@ -237,10 +236,10 @@ structures.
 ### 1. Username/Password
 
 ```bash
-MQTT1_ENABLED=true
-MQTT1_SERVER=mqtt.example.com
-MQTT1_USERNAME=your_username
-MQTT1_PASSWORD=your_password
+MCTOMQTT_MQTT1_ENABLED=true
+MCTOMQTT_MQTT1_SERVER=mqtt.example.com
+MCTOMQTT_MQTT1_USERNAME=your_username
+MCTOMQTT_MQTT1_PASSWORD=your_password
 ```
 
 ### 2. Auth Token (Public Key Based)
@@ -249,10 +248,10 @@ Requires `@michaelhart/meshcore-decoder` and firmware supporting `get prv.key`
 command.
 
 ```bash
-MQTT1_ENABLED=true
-MQTT1_SERVER=mqtt-us-v1.letsmesh.net
-MQTT1_USE_AUTH_TOKEN=true
-MQTT1_TOKEN_AUDIENCE=mqtt-us-v1.letsmesh.net
+MCTOMQTT_MQTT1_ENABLED=true
+MCTOMQTT_MQTT1_SERVER=mqtt-us-v1.letsmesh.net
+MCTOMQTT_MQTT1_USE_AUTH_TOKEN=true
+MCTOMQTT_MQTT1_TOKEN_AUDIENCE=mqtt-us-v1.letsmesh.net
 ```
 
 The script will:
@@ -271,6 +270,17 @@ curl -o- https://raw.githubusercontent.com/nvm-sh/nvm/v0.39.7/install.sh | bash
 # Restart shell or: source ~/.bashrc
 nvm install --lts
 npm install -g @michaelhart/meshcore-decoder
+```
+
+### Additional Settings
+
+```bash
+# Logging level: DEBUG, INFO, WARNING, ERROR, CRITICAL
+MCTOMQTT_LOG_LEVEL=INFO
+
+# Wait for system clock sync before setting repeater time (default: true)
+# Set to false on systems without timedatectl or NTP
+MCTOMQTT_SYNC_TIME=true
 ```
 
 ## Running the Script
@@ -474,28 +484,21 @@ don't have the key will be forwarded as encrypted data.
 
 ## Viewing the data
 
-- Use a MQTT tool to view the packet data.
-
-  I recommend MQTTX
-- Data will appear in the following topics...
+- Use a MQTT tool to view the packet data. I recommend MQTTX.
+- Data will appear in topics based on your configuration. Default format:
   ```
-  TOPIC_STATUS = "meshcore/status"
-  TOPIC_RAW = "meshcore/raw"
-  TOPIC_DEBUG = "meshcore/debug"
-  TOPIC_PACKETS = "meshcore/packets"
-  TOPIC_DECODED = "meshcore/decoded"
+  meshcore/{IATA}/{PUBLIC_KEY}/status
+  meshcore/{IATA}/{PUBLIC_KEY}/packets
+  meshcore/{IATA}/{PUBLIC_KEY}/debug
   ```
-  Status: The last will and testement (LWT) of each node connected. Here you can
-  see online / offline status of a node on the MQTT server.
+  Where `{IATA}` is your 3-letter location code and `{PUBLIC_KEY}` is your
+  device's public key (auto-detected).
 
-  RAW: The raw packet data going through the repeater.
+  **status**: Last will and testament (LWT) showing online/offline status.
 
-  DEBUG: The debug info (if enabled on the repeater build)
+  **packets**: Flood or direct packets going through the repeater.
 
-  PACKETS: The flood or direct packets going through the repeater.
-
-  DECODED: Packets are decoded (and decrypted when the key is known) and
-  pubished to this topic as unencrypted JSON
+  **debug**: Debug info (if enabled on the repeater build).
 
 ## Example MQTT data...
 
