@@ -409,6 +409,72 @@ prompt_owner_pubkey() {
     done
 }
 
+# Prompt for remote serial allowed companions (comma-separated public keys)
+prompt_allowed_companions() {
+    local existing="$1"
+    local companions=""
+    local validated_list=""
+    
+    echo "" >&2
+    print_header "Remote Serial Access (Experimental)" >&2
+    echo "" >&2
+    print_info "Remote Serial allows you to execute serial commands on your node" >&2
+    print_info "remotely via the LetsMesh Packet Analyzer web interface." >&2
+    echo "" >&2
+    print_info "You must specify which companion devices (by public key) are" >&2
+    print_info "authorized to send commands. Commands are cryptographically signed." >&2
+    echo "" >&2
+    
+    if [ -n "$existing" ]; then
+        print_info "Current allowed companions:" >&2
+        echo "$existing" | tr ',' '\n' | while read -r key; do
+            [ -n "$key" ] && echo "  - $key" >&2
+        done
+        echo "" >&2
+    fi
+    
+    if ! prompt_yes_no "Configure remote serial access?" "n"; then
+        echo "$existing"
+        return 0
+    fi
+    
+    echo "" >&2
+    print_info "Enter companion public keys (64 hex chars each)" >&2
+    print_info "Enter one key at a time. Leave empty when done." >&2
+    echo "" >&2
+    
+    local keys=()
+    local key_num=1
+    
+    while true; do
+        local key=$(prompt_input "Companion $key_num public key (empty to finish)" "")
+        
+        # Empty means done
+        if [ -z "$key" ]; then
+            break
+        fi
+        
+        # Validate and normalize
+        local validated=$(validate_meshcore_pubkey "$key")
+        if [ $? -eq 0 ]; then
+            keys+=("$validated")
+            print_success "Added: $validated" >&2
+            ((key_num++))
+        else
+            print_error "Invalid public key format. Must be 64 hex characters." >&2
+        fi
+    done
+    
+    if [ ${#keys[@]} -eq 0 ]; then
+        echo ""
+        return 0
+    fi
+    
+    # Join with commas
+    local IFS=','
+    echo "${keys[*]}"
+}
+
 # Update owner public key and email for existing brokers using auth tokens
 update_owner_info() {
     ENV_LOCAL="$INSTALL_DIR/.env.local"
@@ -452,6 +518,25 @@ update_owner_info() {
             echo "    Email: (not set)"
         fi
     done
+    
+    # Show current remote serial configuration
+    local existing_rs_enabled=$(grep "^MCTOMQTT_REMOTE_SERIAL_ENABLED=" "$ENV_LOCAL" 2>/dev/null | cut -d'=' -f2)
+    local existing_companions=$(grep "^MCTOMQTT_REMOTE_SERIAL_ALLOWED_COMPANIONS=" "$ENV_LOCAL" 2>/dev/null | cut -d'=' -f2)
+    echo ""
+    echo "  Remote Serial:"
+    if [ "$existing_rs_enabled" = "true" ]; then
+        echo "    Enabled: yes"
+    else
+        echo "    Enabled: no"
+    fi
+    echo "    Allowed Companions:"
+    if [ -n "$existing_companions" ]; then
+        echo "$existing_companions" | tr ',' '\n' | while read -r key; do
+            [ -n "$key" ] && echo "      - $key"
+        done
+    else
+        echo "      (none configured)"
+    fi
     echo ""
     
     # Get first existing owner and email or empty
@@ -507,6 +592,33 @@ MCTOMQTT_MQTT${broker_num}_TOKEN_EMAIL=$new_email" "$ENV_LOCAL" && rm -f "$ENV_L
         fi
     done
     
+    # Prompt for remote serial companions (existing_companions and existing_rs_enabled read above for display)
+    local new_companions=$(prompt_allowed_companions "$existing_companions")
+    
+    # Determine new enabled state based on companions
+    local new_rs_enabled="false"
+    if [ -n "$new_companions" ]; then
+        new_rs_enabled="true"
+    fi
+    
+    # Update remote serial config if changed
+    local rs_changed=false
+    if [ "$new_companions" != "$existing_companions" ] || [ "$new_rs_enabled" != "$existing_rs_enabled" ]; then
+        rs_changed=true
+        
+        # Remove existing lines if present
+        if grep -q "^MCTOMQTT_REMOTE_SERIAL_ENABLED=" "$ENV_LOCAL"; then
+            sed -i.tmp "/^MCTOMQTT_REMOTE_SERIAL_ENABLED=/d" "$ENV_LOCAL" && rm -f "$ENV_LOCAL.tmp"
+        fi
+        if grep -q "^MCTOMQTT_REMOTE_SERIAL_ALLOWED_COMPANIONS=" "$ENV_LOCAL"; then
+            sed -i.tmp "/^MCTOMQTT_REMOTE_SERIAL_ALLOWED_COMPANIONS=/d" "$ENV_LOCAL" && rm -f "$ENV_LOCAL.tmp"
+        fi
+        
+        # Add new config
+        echo "MCTOMQTT_REMOTE_SERIAL_ENABLED=$new_rs_enabled" >> "$ENV_LOCAL"
+        echo "MCTOMQTT_REMOTE_SERIAL_ALLOWED_COMPANIONS=$new_companions" >> "$ENV_LOCAL"
+    fi
+    
     # Display summary
     local changes=()
     if [ -n "$new_owner" ]; then
@@ -515,9 +627,17 @@ MCTOMQTT_MQTT${broker_num}_TOKEN_EMAIL=$new_email" "$ENV_LOCAL" && rm -f "$ENV_L
     if [ -n "$new_email" ]; then
         changes+=("email: $new_email")
     fi
+    if [ "$rs_changed" = true ]; then
+        if [ -n "$new_companions" ]; then
+            local companion_count=$(echo "$new_companions" | tr ',' '\n' | grep -c '.')
+            changes+=("remote serial: enabled with $companion_count companion(s)")
+        else
+            changes+=("remote serial: disabled")
+        fi
+    fi
     
     if [ ${#changes[@]} -gt 0 ]; then
-        print_success "Updated ${#auth_token_brokers[@]} broker(s) with ${changes[*]}"
+        print_success "Updated configuration: ${changes[*]}"
     else
         print_success "No changes made"
     fi
@@ -745,6 +865,9 @@ EOF
             OWNER_PUBKEY=$(prompt_owner_pubkey "")
             OWNER_EMAIL=$(prompt_owner_email "")
             
+            # Prompt for remote serial allowed companions
+            ALLOWED_COMPANIONS=$(prompt_allowed_companions "")
+            
             # Configure MQTT1 (US)
             cat >> "$ENV_LOCAL" << EOF
 
@@ -783,6 +906,17 @@ EOF
             fi
             if [ -n "$OWNER_EMAIL" ]; then
                 echo "MCTOMQTT_MQTT2_TOKEN_EMAIL=$OWNER_EMAIL" >> "$ENV_LOCAL"
+            fi
+            
+            # Write remote serial config if companions were specified
+            if [ -n "$ALLOWED_COMPANIONS" ]; then
+                cat >> "$ENV_LOCAL" << EOF
+
+# Remote Serial Access (Experimental)
+MCTOMQTT_REMOTE_SERIAL_ENABLED=true
+MCTOMQTT_REMOTE_SERIAL_ALLOWED_COMPANIONS=$ALLOWED_COMPANIONS
+EOF
+                print_success "Remote serial access enabled with $(echo "$ALLOWED_COMPANIONS" | tr ',' '\n' | wc -l | tr -d ' ') companion(s)"
             fi
             
             # Build success message
@@ -1385,10 +1519,29 @@ main() {
                         echo "    Email: (not set)"
                     fi
                 done
+                
+                # Show remote serial configuration
+                local rs_enabled=$(grep "^MCTOMQTT_REMOTE_SERIAL_ENABLED=" "$INSTALL_DIR/.env.local" 2>/dev/null | cut -d'=' -f2)
+                local existing_companions=$(grep "^MCTOMQTT_REMOTE_SERIAL_ALLOWED_COMPANIONS=" "$INSTALL_DIR/.env.local" 2>/dev/null | cut -d'=' -f2)
+                echo ""
+                echo "  Remote Serial:"
+                if [ "$rs_enabled" = "true" ]; then
+                    echo "    Enabled: yes"
+                else
+                    echo "    Enabled: no"
+                fi
+                echo "    Allowed Companions:"
+                if [ -n "$existing_companions" ]; then
+                    echo "$existing_companions" | tr ',' '\n' | while read -r key; do
+                        [ -n "$key" ] && echo "      - $key"
+                    done
+                else
+                    echo "      (none configured)"
+                fi
                 echo ""
                 
-                # Offer to update owner information
-                if prompt_yes_no "Update owner information for auth token brokers?" "n"; then
+                # Offer to update owner information or remote serial config
+                if prompt_yes_no "Update owner information or remote serial configuration?" "n"; then
                     update_owner_info
                 fi
             fi
