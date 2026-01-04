@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-__version__ = "1.0.6.4"
+__version__ = "1.0.7.0"
 
 import sys
 import os
@@ -16,7 +16,7 @@ import random
 import subprocess
 from datetime import datetime
 from time import sleep
-from auth_token import create_auth_token, read_private_key_file
+from auth_token import create_auth_token, read_private_key_file, verify_auth_token, decode_token_payload
 
 try:
     import paho.mqtt.client as mqtt
@@ -141,6 +141,14 @@ class MeshCoreBridge:
         self.ws_ping_threads = {}  # Track WebSocket ping threads per broker
         self.sync_time_at_start = self.get_env_bool('SYNC_TIME', True) # issues a command to sync the pi's clock at script start
 
+        # Remote serial configuration
+        self.remote_serial_enabled = self.get_env_bool('REMOTE_SERIAL_ENABLED', False)
+        self.remote_serial_allowed_companions = self._parse_allowed_companions()
+        self.remote_serial_disallowed_commands = self._parse_disallowed_commands()
+        self.remote_serial_nonce_ttl = self.get_env_int('REMOTE_SERIAL_NONCE_TTL', 120)  # 2 minutes
+        self.remote_serial_nonces = {}  # {nonce: timestamp} for replay protection
+        self.remote_serial_command_timeout = self.get_env_int('REMOTE_SERIAL_COMMAND_TIMEOUT', 10)  # seconds
+
         # Statistics tracking
         self.stats = {
             'start_time': time.time(),
@@ -189,6 +197,52 @@ class MeshCoreBridge:
             return int(self.get_env(key, str(fallback)))
         except ValueError:
             return fallback
+    
+    def _parse_allowed_companions(self):
+        """Parse REMOTE_SERIAL_ALLOWED_COMPANIONS env var into a set of public keys"""
+        companions_str = self.get_env('REMOTE_SERIAL_ALLOWED_COMPANIONS', '')
+        if not companions_str:
+            return set()
+        
+        companions = set()
+        for key in companions_str.split(','):
+            key = key.strip().upper()
+            # Validate it's a valid 64-char hex public key
+            if len(key) == 64 and all(c in '0123456789ABCDEF' for c in key):
+                companions.add(key)
+            elif key:  # Only warn if non-empty
+                logger.warning(f"Invalid companion public key in allowlist: {key[:16]}...")
+        
+        if companions:
+            logger.info(f"Remote serial enabled with {len(companions)} allowed companion(s)")
+        return companions
+    
+    def _parse_disallowed_commands(self):
+        """Parse REMOTE_SERIAL_DISALLOWED_COMMANDS env var into a list of command prefixes"""
+        disallowed_str = self.get_env('REMOTE_SERIAL_DISALLOWED_COMMANDS', '')
+        
+        if not disallowed_str:
+            return []
+        
+        disallowed = []
+        for cmd in disallowed_str.split(','):
+            cmd = cmd.strip().lower()
+            if cmd:
+                disallowed.append(cmd)
+        
+        if disallowed:
+            logger.debug(f"Remote serial disallowed commands: {disallowed}")
+        return disallowed
+    
+    def _is_command_allowed(self, command):
+        """Check if a command is allowed (not in disallowed list)"""
+        cmd_lower = command.strip().lower()
+        
+        for disallowed in self.remote_serial_disallowed_commands:
+            if cmd_lower.startswith(disallowed):
+                return False, disallowed
+        
+        return True, None
     
     def resolve_topic_template(self, template, broker_num=None):
         """Resolve topic template with {IATA} and {PUBLIC_KEY} placeholders"""
@@ -802,6 +856,9 @@ class MeshCoreBridge:
                     pass  # Don't reset failed_attempts here - let it reset after 120s of stability
             except Exception as e:
                 logger.error(f"[MQTT{broker_num}] Failed to publish online status: {e}")
+            
+            # Subscribe to remote serial commands (if enabled)
+            self._subscribe_serial_commands(client, broker_num)
         else:
             logger.error(f"[MQTT{broker_num}] Connection failed with code: {rc}")
 
@@ -854,6 +911,254 @@ class MeshCoreBridge:
         all_disconnected = all(not info.get('connected', False) for info in self.mqtt_clients)
         if all_disconnected:
             self.mqtt_connected = False
+
+    def on_mqtt_message(self, client, userdata, msg):
+        """Handle incoming MQTT messages (for remote serial commands)"""
+        broker_num = userdata.get('broker_num', None) if userdata else None
+        topic = msg.topic
+        
+        # Only handle serial command messages
+        if '/serial/commands' not in topic:
+            return
+        
+        logger.debug(f"[MQTT{broker_num}] Received message on {topic}")
+        
+        try:
+            jwt_token = msg.payload.decode('utf-8').strip()
+            self._handle_serial_command(jwt_token, broker_num)
+        except Exception as e:
+            logger.error(f"[SERIAL] Failed to handle command: {e}")
+
+    def _handle_serial_command(self, jwt_token, broker_num):
+        """Process an incoming serial command JWT"""
+        if not self.remote_serial_enabled:
+            logger.warning("[SERIAL] Remote serial command received but feature is disabled")
+            return
+        
+        if not self.remote_serial_allowed_companions:
+            logger.warning("[SERIAL] Remote serial command received but no companions are allowed")
+            return
+        
+        # First decode without verification to get the public key
+        try:
+            payload = decode_token_payload(jwt_token)
+        except Exception as e:
+            logger.warning(f"[SERIAL] Failed to decode command JWT: {e}")
+            return
+        
+        # Extract and validate required fields
+        companion_pubkey = payload.get('publicKey', '').upper()
+        command = payload.get('command', '')
+        target = payload.get('target', '').upper()
+        nonce = payload.get('nonce', '')
+        exp = payload.get('exp')
+        iat = payload.get('iat')
+        
+        if not companion_pubkey or not command or not target or not nonce:
+            logger.warning(f"[SERIAL] Missing required fields in command JWT")
+            return
+        
+        # Verify target matches our public key
+        if target != self.repeater_pub_key:
+            logger.debug(f"[SERIAL] Command target {target[:8]}... doesn't match our key {self.repeater_pub_key[:8]}...")
+            return
+        
+        # Verify companion is in allowlist
+        if companion_pubkey not in self.remote_serial_allowed_companions:
+            logger.warning(f"[SERIAL] Command from unauthorized companion: {companion_pubkey[:16]}...")
+            self._publish_serial_response(command, nonce, False, "Unauthorized companion", broker_num)
+            return
+        
+        # Check expiry against our system clock
+        current_time = int(time.time())
+        if exp and current_time > exp:
+            logger.warning(f"[SERIAL] Command JWT expired (exp={exp}, now={current_time})")
+            self._publish_serial_response(command, nonce, False, "Command expired", broker_num)
+            return
+        
+        # Check nonce for replay protection
+        self._cleanup_old_nonces()
+        if nonce in self.remote_serial_nonces:
+            logger.warning(f"[SERIAL] Duplicate nonce detected (replay attack?): {nonce[:16]}...")
+            return  # Silently drop replays
+        
+        # Verify JWT signature using meshcore-decoder CLI
+        try:
+            verified_payload = verify_auth_token(jwt_token, companion_pubkey)
+            logger.debug(f"[SERIAL] JWT signature verified for companion {companion_pubkey[:16]}...")
+        except Exception as e:
+            logger.warning(f"[SERIAL] JWT signature verification failed: {e}")
+            self._publish_serial_response(command, nonce, False, "Invalid signature", broker_num)
+            return
+        
+        # Record nonce to prevent replay
+        self.remote_serial_nonces[nonce] = current_time
+        
+        # Check if command is disallowed
+        allowed, matched_rule = self._is_command_allowed(command)
+        if not allowed:
+            logger.warning(f"[SERIAL] Command blocked by rule '{matched_rule}': {command}")
+            self._publish_serial_response(command, nonce, False, f"Command blocked: {matched_rule}", broker_num)
+            return
+        
+        # Execute the serial command
+        logger.info(f"[SERIAL] Executing command from {companion_pubkey[:16]}...: {command}")
+        success, response = self._execute_serial_command(command)
+        
+        # Publish response
+        self._publish_serial_response(command, nonce, success, response, broker_num)
+
+    def _execute_serial_command(self, command):
+        """
+        Execute a serial command on the node and capture the response.
+        Returns (success: bool, response: str)
+        """
+        if not self.ser:
+            return False, "Serial port not connected"
+        
+        try:
+            with self.ser_lock:
+                # Flush buffers
+                self.ser.reset_input_buffer()
+                self.ser.reset_output_buffer()
+                
+                # Send command (add newline if not present)
+                cmd_bytes = command.strip()
+                if not cmd_bytes.endswith('\r\n'):
+                    cmd_bytes += '\r\n'
+                
+                self.ser.write(cmd_bytes.encode('utf-8'))
+                logger.debug(f"[SERIAL] Sent: {command.strip()}")
+                
+                # Wait for response with timeout
+                timeout = self.remote_serial_command_timeout
+                start_time = time.time()
+                response_lines = []
+                
+                while (time.time() - start_time) < timeout:
+                    sleep(0.1)  # Small delay between reads
+                    
+                    if self.ser.in_waiting > 0:
+                        data = self.ser.read_all().decode(errors='replace')
+                        response_lines.append(data)
+                        
+                        # Check if we got a complete response (ends with prompt or newline)
+                        full_response = ''.join(response_lines)
+                        if '-> ' in full_response or full_response.rstrip().endswith('>'):
+                            break
+                
+                # Parse response - extract the actual response after "-> "
+                full_response = ''.join(response_lines)
+                
+                # Find the response content after "-> " or "> "
+                if "-> >" in full_response:
+                    response_text = full_response.split("-> >")[1].strip()
+                elif "-> " in full_response:
+                    response_text = full_response.split("-> ", 1)[1].strip()
+                elif "> " in full_response:
+                    response_text = full_response.split("> ", 1)[1].strip()
+                else:
+                    response_text = full_response.strip()
+                
+                # Clean up response (remove echo of command if present)
+                if response_text.startswith(command.strip()):
+                    response_text = response_text[len(command.strip()):].strip()
+                
+                # Remove trailing prompts
+                response_text = response_text.rstrip('> ').strip()
+                
+                if not response_text:
+                    response_text = "(no output)"
+                
+                logger.debug(f"[SERIAL] Response: {response_text[:100]}{'...' if len(response_text) > 100 else ''}")
+                return True, response_text
+                
+        except serial.SerialException as e:
+            logger.error(f"[SERIAL] Serial error executing command: {e}")
+            return False, f"Serial error: {str(e)}"
+        except Exception as e:
+            logger.error(f"[SERIAL] Error executing command: {e}")
+            return False, f"Error: {str(e)}"
+
+    def _publish_serial_response(self, command, request_id, success, response, broker_num=None):
+        """Create and publish a signed response JWT"""
+        if not self.repeater_priv_key or not self.repeater_pub_key:
+            logger.error("[SERIAL] Cannot sign response - private key not available")
+            return
+        
+        try:
+            # Create response JWT with claims
+            claims = {
+                'command': command,
+                'request_id': request_id,
+                'success': success,
+                'response': response
+            }
+            
+            # Create signed JWT using meshcore-decoder
+            response_jwt = create_auth_token(
+                self.repeater_pub_key,
+                self.repeater_priv_key,
+                expiry_seconds=60,  # Short expiry for responses
+                **claims
+            )
+            
+            # Publish to response topic
+            # Topic: meshcore/{IATA}/{PUBLIC_KEY}/serial/responses
+            response_topic = f"meshcore/{self.global_iata}/{self.repeater_pub_key}/serial/responses"
+            
+            # Publish to all connected brokers for redundancy
+            published = False
+            for mqtt_info in self.mqtt_clients:
+                if mqtt_info.get('connected', False):
+                    try:
+                        result = mqtt_info['client'].publish(response_topic, response_jwt, qos=1)
+                        if result.rc == mqtt.MQTT_ERR_SUCCESS:
+                            published = True
+                            logger.debug(f"[MQTT{mqtt_info['broker_num']}] Published serial response to {response_topic}")
+                    except Exception as e:
+                        logger.error(f"[MQTT{mqtt_info['broker_num']}] Failed to publish serial response: {e}")
+            
+            if published:
+                logger.info(f"[SERIAL] Response published (success={success}, request_id={request_id[:16]}...)")
+            else:
+                logger.error("[SERIAL] Failed to publish response to any broker")
+                
+        except Exception as e:
+            logger.error(f"[SERIAL] Failed to create/publish response: {e}")
+
+    def _cleanup_old_nonces(self):
+        """Remove expired nonces from the tracking dict"""
+        current_time = int(time.time())
+        cutoff_time = current_time - self.remote_serial_nonce_ttl
+        
+        expired = [nonce for nonce, ts in self.remote_serial_nonces.items() if ts < cutoff_time]
+        for nonce in expired:
+            del self.remote_serial_nonces[nonce]
+        
+        if expired:
+            logger.debug(f"[SERIAL] Cleaned up {len(expired)} expired nonces")
+
+    def _subscribe_serial_commands(self, client, broker_num):
+        """Subscribe to the serial/commands topic for this node"""
+        if not self.remote_serial_enabled:
+            return
+        
+        if not self.repeater_pub_key:
+            logger.warning(f"[MQTT{broker_num}] Cannot subscribe to serial commands - public key not available")
+            return
+        
+        # Topic: meshcore/{IATA}/{PUBLIC_KEY}/serial/commands
+        topic = f"meshcore/{self.global_iata}/{self.repeater_pub_key}/serial/commands"
+        
+        try:
+            result = client.subscribe(topic, qos=1)
+            if result[0] == mqtt.MQTT_ERR_SUCCESS:
+                logger.info(f"[MQTT{broker_num}] Subscribed to remote serial: {topic}")
+            else:
+                logger.error(f"[MQTT{broker_num}] Failed to subscribe to {topic}: {mqtt.error_string(result[0])}")
+        except Exception as e:
+            logger.error(f"[MQTT{broker_num}] Error subscribing to {topic}: {e}")
 
     def build_status_message(self, status, include_stats=True):
         """Build a status message with all required fields"""
@@ -961,6 +1266,7 @@ class MeshCoreBridge:
         # Set callbacks
         mqtt_client.on_connect = self.on_mqtt_connect
         mqtt_client.on_disconnect = self.on_mqtt_disconnect
+        mqtt_client.on_message = self.on_mqtt_message
         
         # Configure TLS
         use_tls = self.get_env_bool(f"MQTT{broker_num}_USE_TLS", False)
@@ -1328,6 +1634,19 @@ class MeshCoreBridge:
         
         # Log client version
         logger.info(f"Client version: {self.client_version}")
+        
+        # Log remote serial configuration
+        if self.remote_serial_enabled:
+            if self.remote_serial_allowed_companions:
+                logger.info(f"Remote serial: ENABLED ({len(self.remote_serial_allowed_companions)} companion(s) allowed)")
+                for pubkey in sorted(self.remote_serial_allowed_companions):
+                    logger.debug(f"  Allowed companion: {pubkey[:16]}...")
+            else:
+                logger.warning("Remote serial: ENABLED but no companions configured (will reject all commands)")
+            if self.remote_serial_disallowed_commands:
+                logger.info(f"Remote serial blocked commands: {self.remote_serial_disallowed_commands}")
+        else:
+            logger.info("Remote serial: DISABLED")
         
         # Initial MQTT connection
         retry_count = 0

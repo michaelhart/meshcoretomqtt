@@ -131,13 +131,32 @@ docker_cmd() {
     fi
 }
 
-# Prompt and validate IATA code
-prompt_iata() {
+# IATA API endpoint (only used for LetsMesh)
+IATA_API_BASE="https://api.letsmesh.net/api/iata"
+
+# Build IATA API URL with source tracking
+iata_api_url() {
+    local params="$1"
+    local version="${SCRIPT_VERSION:-unknown}"
+    echo "${IATA_API_BASE}?${params}&source=installer-${version}"
+}
+
+# Search IATA airports via API (LetsMesh only)
+# Returns format: "IATA|Name" for each match (server-side filtering)
+search_iata_api() {
+    local query="$1"
+    curl -fsSL --retry 2 --retry-delay 1 "$(iata_api_url "search=${query}")" 2>/dev/null | \
+        jq -r '.[] | "\(.iata)|\(.name)"' 2>/dev/null
+}
+
+# Simple IATA prompt - just asks for 3-letter code (for non-LetsMesh users)
+prompt_iata_simple() {
     local existing="$1"
     local iata=""
     
     echo "" >&2
-    print_info "IATA code is a 3-letter airport code (e.g., SEA, LAX, NYC, LON)" >&2
+    print_info "IATA code is a 3-letter airport code identifying your region (e.g., SEA, LAX, NYC)" >&2
+    print_info "Search/view all IATA codes on a map: https://analyzer.letsmesh.net/map/iata" >&2
     echo "" >&2
     
     while [ -z "$iata" ] || [ "$iata" = "XXX" ]; do
@@ -145,13 +164,122 @@ prompt_iata() {
         iata=$(echo "$iata" | tr '[:lower:]' '[:upper:]' | tr -d ' ')
         
         if [ -z "$iata" ] || [ "$iata" = "XXX" ]; then
-            print_error "Please enter a valid IATA code"
-        elif [ ${#iata} -ne 3 ] && ! prompt_yes_no "Use '$iata' anyway?" "n"; then
-            iata=""
+            print_error "Please enter a valid IATA code" >&2
+        elif [ ${#iata} -ne 3 ]; then
+            print_warning "IATA codes are typically 3 letters" >&2
+            if ! prompt_yes_no "Use '$iata' anyway?" "n"; then
+                iata=""
+            fi
         fi
     done
     
     echo "$iata"
+}
+
+# Interactive IATA selection with API search (LetsMesh only - requires jq)
+prompt_iata_letsmesh() {
+    local existing="$1"
+    local selected_iata=""
+    local search_query=""
+    
+    echo "" >&2
+    print_header "IATA Region Selection" >&2
+    echo "" >&2
+    print_info "Your IATA code identifies your geographic region (e.g., SEA, LAX, NYC, LON)" >&2
+    print_info "Type to search by airport code or city name" >&2
+    print_info "View all IATA codes on a map: https://analyzer.letsmesh.net/map/iata" >&2
+    echo "" >&2
+    
+    while [ -z "$selected_iata" ]; do
+        # Read search query
+        read -p "Search (or enter IATA code directly): " search_query </dev/tty
+        search_query=$(echo "$search_query" | tr -d '\r\n')
+        
+        if [ -z "$search_query" ]; then
+            print_error "Please enter a search term" >&2
+            continue
+        fi
+        
+        # If it's exactly 3 uppercase letters, try direct lookup first
+        local upper_query=$(echo "$search_query" | tr '[:lower:]' '[:upper:]' | tr -d ' ')
+        if [[ "$upper_query" =~ ^[A-Z]{3}$ ]]; then
+            # Try to validate this IATA code
+            print_info "Looking up $upper_query..." >&2
+            local direct_result
+            direct_result=$(curl -fsSL --retry 2 --retry-delay 1 "$(iata_api_url "code=${upper_query}")" 2>/dev/null)
+            
+            if [ -n "$direct_result" ] && echo "$direct_result" | jq -e '.iata' &>/dev/null; then
+                local name=$(echo "$direct_result" | jq -r '.name')
+                echo "" >&2
+                print_success "Found: ${upper_query} - ${name}" >&2
+                echo "" >&2
+                if prompt_yes_no "Use this IATA code?" "y"; then
+                    selected_iata="$upper_query"
+                    echo "" >&2
+                    print_success "Selected: ${selected_iata} - ${name}" >&2
+                    break
+                fi
+                echo "" >&2
+                continue
+            else
+                print_error "IATA code '$upper_query' not found in database" >&2
+                echo "" >&2
+                continue
+            fi
+        fi
+        
+        # Search via API
+        print_info "Searching..." >&2
+        local results
+        results=$(search_iata_api "$search_query")
+        
+        if [ -z "$results" ]; then
+            print_error "No matching airports found for '$search_query'" >&2
+            echo "" >&2
+            continue
+        fi
+        
+        # Display results
+        echo "" >&2
+        print_info "Matching airports:" >&2
+        echo "" >&2
+        
+        local i=1
+        local iatas=()
+        local names=()
+        
+        while IFS='|' read -r iata name; do
+            echo "  $i) ${iata} - ${name}" >&2
+            iatas+=("$iata")
+            names+=("$name")
+            ((i++))
+        done <<< "$results"
+        
+        echo "" >&2
+        echo "  s) Search again" >&2
+        echo "" >&2
+        
+        local choice
+        read -p "Select [1-$((i-1))] or 's' to search again: " choice </dev/tty
+        
+        if [ "$choice" = "s" ] || [ "$choice" = "S" ]; then
+            echo "" >&2
+            continue
+        fi
+        
+        if [[ "$choice" =~ ^[0-9]+$ ]] && [ "$choice" -ge 1 ] && [ "$choice" -lt "$i" ]; then
+            local idx=$((choice - 1))
+            selected_iata="${iatas[$idx]}"
+            local selected_name="${names[$idx]}"
+            echo "" >&2
+            print_success "Selected: ${selected_iata} - ${selected_name}" >&2
+        else
+            print_error "Invalid selection" >&2
+            echo "" >&2
+        fi
+    done
+    
+    echo "$selected_iata"
 }
 
 # Validate and normalize MeshCore public key
@@ -281,6 +409,72 @@ prompt_owner_pubkey() {
     done
 }
 
+# Prompt for remote serial allowed companions (comma-separated public keys)
+prompt_allowed_companions() {
+    local existing="$1"
+    local companions=""
+    local validated_list=""
+    
+    echo "" >&2
+    print_header "Remote Serial Access (Experimental)" >&2
+    echo "" >&2
+    print_info "Remote Serial allows you to execute serial commands on your node" >&2
+    print_info "remotely via the LetsMesh Packet Analyzer web interface." >&2
+    echo "" >&2
+    print_info "You must specify which companion devices (by public key) are" >&2
+    print_info "authorized to send commands. Commands are cryptographically signed." >&2
+    echo "" >&2
+    
+    if [ -n "$existing" ]; then
+        print_info "Current allowed companions:" >&2
+        echo "$existing" | tr ',' '\n' | while read -r key; do
+            [ -n "$key" ] && echo "  - $key" >&2
+        done
+        echo "" >&2
+    fi
+    
+    if ! prompt_yes_no "Configure remote serial access?" "n"; then
+        echo "$existing"
+        return 0
+    fi
+    
+    echo "" >&2
+    print_info "Enter companion public keys (64 hex chars each)" >&2
+    print_info "Enter one key at a time. Leave empty when done." >&2
+    echo "" >&2
+    
+    local keys=()
+    local key_num=1
+    
+    while true; do
+        local key=$(prompt_input "Companion $key_num public key (empty to finish)" "")
+        
+        # Empty means done
+        if [ -z "$key" ]; then
+            break
+        fi
+        
+        # Validate and normalize
+        local validated=$(validate_meshcore_pubkey "$key")
+        if [ $? -eq 0 ]; then
+            keys+=("$validated")
+            print_success "Added: $validated" >&2
+            ((key_num++))
+        else
+            print_error "Invalid public key format. Must be 64 hex characters." >&2
+        fi
+    done
+    
+    if [ ${#keys[@]} -eq 0 ]; then
+        echo ""
+        return 0
+    fi
+    
+    # Join with commas
+    local IFS=','
+    echo "${keys[*]}"
+}
+
 # Update owner public key and email for existing brokers using auth tokens
 update_owner_info() {
     ENV_LOCAL="$INSTALL_DIR/.env.local"
@@ -324,6 +518,25 @@ update_owner_info() {
             echo "    Email: (not set)"
         fi
     done
+    
+    # Show current remote serial configuration
+    local existing_rs_enabled=$(grep "^MCTOMQTT_REMOTE_SERIAL_ENABLED=" "$ENV_LOCAL" 2>/dev/null | cut -d'=' -f2)
+    local existing_companions=$(grep "^MCTOMQTT_REMOTE_SERIAL_ALLOWED_COMPANIONS=" "$ENV_LOCAL" 2>/dev/null | cut -d'=' -f2)
+    echo ""
+    echo "  Remote Serial:"
+    if [ "$existing_rs_enabled" = "true" ]; then
+        echo "    Enabled: yes"
+    else
+        echo "    Enabled: no"
+    fi
+    echo "    Allowed Companions:"
+    if [ -n "$existing_companions" ]; then
+        echo "$existing_companions" | tr ',' '\n' | while read -r key; do
+            [ -n "$key" ] && echo "      - $key"
+        done
+    else
+        echo "      (none configured)"
+    fi
     echo ""
     
     # Get first existing owner and email or empty
@@ -379,6 +592,33 @@ MCTOMQTT_MQTT${broker_num}_TOKEN_EMAIL=$new_email" "$ENV_LOCAL" && rm -f "$ENV_L
         fi
     done
     
+    # Prompt for remote serial companions (existing_companions and existing_rs_enabled read above for display)
+    local new_companions=$(prompt_allowed_companions "$existing_companions")
+    
+    # Determine new enabled state based on companions
+    local new_rs_enabled="false"
+    if [ -n "$new_companions" ]; then
+        new_rs_enabled="true"
+    fi
+    
+    # Update remote serial config if changed
+    local rs_changed=false
+    if [ "$new_companions" != "$existing_companions" ] || [ "$new_rs_enabled" != "$existing_rs_enabled" ]; then
+        rs_changed=true
+        
+        # Remove existing lines if present
+        if grep -q "^MCTOMQTT_REMOTE_SERIAL_ENABLED=" "$ENV_LOCAL"; then
+            sed -i.tmp "/^MCTOMQTT_REMOTE_SERIAL_ENABLED=/d" "$ENV_LOCAL" && rm -f "$ENV_LOCAL.tmp"
+        fi
+        if grep -q "^MCTOMQTT_REMOTE_SERIAL_ALLOWED_COMPANIONS=" "$ENV_LOCAL"; then
+            sed -i.tmp "/^MCTOMQTT_REMOTE_SERIAL_ALLOWED_COMPANIONS=/d" "$ENV_LOCAL" && rm -f "$ENV_LOCAL.tmp"
+        fi
+        
+        # Add new config
+        echo "MCTOMQTT_REMOTE_SERIAL_ENABLED=$new_rs_enabled" >> "$ENV_LOCAL"
+        echo "MCTOMQTT_REMOTE_SERIAL_ALLOWED_COMPANIONS=$new_companions" >> "$ENV_LOCAL"
+    fi
+    
     # Display summary
     local changes=()
     if [ -n "$new_owner" ]; then
@@ -387,9 +627,17 @@ MCTOMQTT_MQTT${broker_num}_TOKEN_EMAIL=$new_email" "$ENV_LOCAL" && rm -f "$ENV_L
     if [ -n "$new_email" ]; then
         changes+=("email: $new_email")
     fi
+    if [ "$rs_changed" = true ]; then
+        if [ -n "$new_companions" ]; then
+            local companion_count=$(echo "$new_companions" | tr ',' '\n' | grep -c '.')
+            changes+=("remote serial: enabled with $companion_count companion(s)")
+        else
+            changes+=("remote serial: disabled")
+        fi
+    fi
     
     if [ ${#changes[@]} -gt 0 ]; then
-        print_success "Updated ${#auth_token_brokers[@]} broker(s) with ${changes[*]}"
+        print_success "Updated configuration: ${changes[*]}"
     else
         print_success "No changes made"
     fi
@@ -562,14 +810,6 @@ MCTOMQTT_IATA=XXX
 EOF
     fi
     
-    # Prompt for IATA if needed
-    IATA=$(grep "^MCTOMQTT_IATA=" "$ENV_LOCAL" 2>/dev/null | cut -d'=' -f2)
-    if [ -z "$IATA" ] || [ "$IATA" = "XXX" ]; then
-        IATA=$(prompt_iata "")
-        sed -i.bak "s/^MCTOMQTT_IATA=.*/MCTOMQTT_IATA=$IATA/" "$ENV_LOCAL" && rm -f "$ENV_LOCAL.bak"
-        print_success "IATA code set to: $IATA"
-    fi
-    
     echo ""
     print_header "MQTT Broker Configuration"
     echo ""
@@ -582,12 +822,51 @@ EOF
     
     if [ "$DECODER_AVAILABLE" = true ]; then
         if prompt_yes_no "Enable LetsMesh Packet Analyzer MQTT servers?" "y"; then
+            # LetsMesh requires jq for IATA validation
+            if ! command -v jq &> /dev/null; then
+                print_error "jq is required for LetsMesh IATA validation but not installed"
+                print_info "Install jq and try again, or choose a custom MQTT broker"
+                echo ""
+                print_info "To install jq:"
+                echo "  Debian/Ubuntu: sudo apt install jq"
+                echo "  macOS: brew install jq"
+                echo "  Fedora: sudo dnf install jq"
+                echo ""
+                if prompt_yes_no "Would you like to configure a custom MQTT broker instead?" "y"; then
+                    # Use simple IATA for custom broker
+                    IATA=$(grep "^MCTOMQTT_IATA=" "$ENV_LOCAL" 2>/dev/null | cut -d'=' -f2)
+                    if [ -z "$IATA" ] || [ "$IATA" = "XXX" ]; then
+                        IATA=$(prompt_iata_simple "")
+                        sed -i.bak "s/^MCTOMQTT_IATA=.*/MCTOMQTT_IATA=$IATA/" "$ENV_LOCAL" && rm -f "$ENV_LOCAL.bak"
+                        print_success "IATA code set to: $IATA"
+                    fi
+                    configure_custom_broker 1
+                    if prompt_yes_no "Would you like to configure additional MQTT brokers?" "n"; then
+                        configure_additional_brokers
+                    fi
+                else
+                    print_warning "No MQTT brokers configured - you'll need to edit .env.local manually"
+                fi
+                return
+            fi
+            
+            # LetsMesh: Use API-validated IATA selection
+            IATA=$(grep "^MCTOMQTT_IATA=" "$ENV_LOCAL" 2>/dev/null | cut -d'=' -f2)
+            if [ -z "$IATA" ] || [ "$IATA" = "XXX" ]; then
+                IATA=$(prompt_iata_letsmesh "")
+                sed -i.bak "s/^MCTOMQTT_IATA=.*/MCTOMQTT_IATA=$IATA/" "$ENV_LOCAL" && rm -f "$ENV_LOCAL.bak"
+                print_success "IATA code set to: $IATA"
+            fi
+            
             # Prompt for owner public key and email once for LetsMesh brokers
             echo ""
             print_info "LetsMesh Packet Analyzer supports optional owner identification"
             print_info "This links your observer to your MeshCore public key and email"
             OWNER_PUBKEY=$(prompt_owner_pubkey "")
             OWNER_EMAIL=$(prompt_owner_email "")
+            
+            # Prompt for remote serial allowed companions
+            ALLOWED_COMPANIONS=$(prompt_allowed_companions "")
             
             # Configure MQTT1 (US)
             cat >> "$ENV_LOCAL" << EOF
@@ -629,6 +908,17 @@ EOF
                 echo "MCTOMQTT_MQTT2_TOKEN_EMAIL=$OWNER_EMAIL" >> "$ENV_LOCAL"
             fi
             
+            # Write remote serial config if companions were specified
+            if [ -n "$ALLOWED_COMPANIONS" ]; then
+                cat >> "$ENV_LOCAL" << EOF
+
+# Remote Serial Access (Experimental)
+MCTOMQTT_REMOTE_SERIAL_ENABLED=true
+MCTOMQTT_REMOTE_SERIAL_ALLOWED_COMPANIONS=$ALLOWED_COMPANIONS
+EOF
+                print_success "Remote serial access enabled with $(echo "$ALLOWED_COMPANIONS" | tr ',' '\n' | wc -l | tr -d ' ') companion(s)"
+            fi
+            
             # Build success message
             local owner_info=""
             if [ -n "$OWNER_PUBKEY" ] && [ -n "$OWNER_EMAIL" ]; then
@@ -646,6 +936,13 @@ EOF
         else
             # User declined LetsMesh, ask if they want to configure a custom broker
             if prompt_yes_no "Would you like to configure a custom MQTT broker?" "y"; then
+                # Use simple IATA for custom broker
+                IATA=$(grep "^MCTOMQTT_IATA=" "$ENV_LOCAL" 2>/dev/null | cut -d'=' -f2)
+                if [ -z "$IATA" ] || [ "$IATA" = "XXX" ]; then
+                    IATA=$(prompt_iata_simple "")
+                    sed -i.bak "s/^MCTOMQTT_IATA=.*/MCTOMQTT_IATA=$IATA/" "$ENV_LOCAL" && rm -f "$ENV_LOCAL.bak"
+                    print_success "IATA code set to: $IATA"
+                fi
                 configure_custom_broker 1
                 
                 if prompt_yes_no "Would you like to configure additional MQTT brokers?" "n"; then
@@ -660,6 +957,13 @@ EOF
         print_warning "meshcore-decoder not available - cannot use LetsMesh auth token authentication"
         
         if prompt_yes_no "Would you like to configure a custom MQTT broker with username/password?" "y"; then
+            # Use simple IATA for custom broker
+            IATA=$(grep "^MCTOMQTT_IATA=" "$ENV_LOCAL" 2>/dev/null | cut -d'=' -f2)
+            if [ -z "$IATA" ] || [ "$IATA" = "XXX" ]; then
+                IATA=$(prompt_iata_simple "")
+                sed -i.bak "s/^MCTOMQTT_IATA=.*/MCTOMQTT_IATA=$IATA/" "$ENV_LOCAL" && rm -f "$ENV_LOCAL.bak"
+                print_success "IATA code set to: $IATA"
+            fi
             configure_custom_broker 1
             
             if prompt_yes_no "Would you like to configure additional MQTT brokers?" "n"; then
@@ -1118,9 +1422,27 @@ main() {
             if prompt_yes_no "Use this configuration?" "y"; then
                 print_success "Using downloaded configuration"
                 
-                # Prompt for IATA
+                # Prompt for IATA - use API validation if config has enabled LetsMesh servers
                 EXISTING_IATA=$(grep "^MCTOMQTT_IATA=" "$INSTALL_DIR/.env.local" 2>/dev/null | cut -d'=' -f2)
-                IATA=$(prompt_iata "$EXISTING_IATA")
+                HAS_LETSMESH=false
+                for broker_num in {1..4}; do
+                    if grep -q "^MCTOMQTT_MQTT${broker_num}_ENABLED=true" "$INSTALL_DIR/.env.local" 2>/dev/null && \
+                       grep -q "^MCTOMQTT_MQTT${broker_num}_SERVER=.*letsmesh\.net" "$INSTALL_DIR/.env.local" 2>/dev/null; then
+                        HAS_LETSMESH=true
+                        break
+                    fi
+                done
+                
+                if [ "$HAS_LETSMESH" = true ]; then
+                    if command -v jq &> /dev/null; then
+                        IATA=$(prompt_iata_letsmesh "$EXISTING_IATA")
+                    else
+                        print_warning "jq not installed - cannot validate IATA against LetsMesh database"
+                        IATA=$(prompt_iata_simple "$EXISTING_IATA")
+                    fi
+                else
+                    IATA=$(prompt_iata_simple "$EXISTING_IATA")
+                fi
                 
                 if grep -q "^MCTOMQTT_IATA=" "$INSTALL_DIR/.env.local"; then
                     sed -i.bak "s/^MCTOMQTT_IATA=.*/MCTOMQTT_IATA=$IATA/" "$INSTALL_DIR/.env.local" && rm -f "$INSTALL_DIR/.env.local.bak"
@@ -1197,16 +1519,42 @@ main() {
                         echo "    Email: (not set)"
                     fi
                 done
+                
+                # Show remote serial configuration
+                local rs_enabled=$(grep "^MCTOMQTT_REMOTE_SERIAL_ENABLED=" "$INSTALL_DIR/.env.local" 2>/dev/null | cut -d'=' -f2)
+                local existing_companions=$(grep "^MCTOMQTT_REMOTE_SERIAL_ALLOWED_COMPANIONS=" "$INSTALL_DIR/.env.local" 2>/dev/null | cut -d'=' -f2)
+                echo ""
+                echo "  Remote Serial:"
+                if [ "$rs_enabled" = "true" ]; then
+                    echo "    Enabled: yes"
+                else
+                    echo "    Enabled: no"
+                fi
+                echo "    Allowed Companions:"
+                if [ -n "$existing_companions" ]; then
+                    echo "$existing_companions" | tr ',' '\n' | while read -r key; do
+                        [ -n "$key" ] && echo "      - $key"
+                    done
+                else
+                    echo "      (none configured)"
+                fi
                 echo ""
                 
-                # Offer to update owner information
-                if prompt_yes_no "Update owner information for auth token brokers?" "n"; then
+                # Offer to update owner information or remote serial config
+                if prompt_yes_no "Update owner information or remote serial configuration?" "n"; then
                     update_owner_info
                 fi
             fi
         fi
     elif [ ! -f "$INSTALL_DIR/.env.local" ]; then
         configure_mqtt_brokers
+    else
+        # .env.local exists but no MQTT configured (incomplete previous install)
+        # Check if any MQTT broker is configured
+        if ! grep -qE "^MCTOMQTT_MQTT[0-9]_ENABLED=true" "$INSTALL_DIR/.env.local" 2>/dev/null; then
+            print_warning "Incomplete configuration detected - MQTT brokers not configured"
+            configure_mqtt_brokers
+        fi
     fi
     
     # Create version info file

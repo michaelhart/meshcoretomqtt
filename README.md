@@ -283,6 +283,46 @@ MCTOMQTT_LOG_LEVEL=INFO
 MCTOMQTT_SYNC_TIME=true
 ```
 
+### Remote Serial (LetsMesh.net Experimental)
+
+Remote serial allows you to execute serial commands on your node remotely via 
+the LetsMesh.net MeshCore Packet Analyzer web interface. Commands are cryptographically 
+signed by an authorized companion device connected via Bluetooth.
+
+**Security Model:**
+- Commands must be signed with an Ed25519 private key
+- Only companions in the allowlist can send commands
+- Each command JWT has a 30-second expiry (checked against system clock)
+- Nonces prevent replay attacks
+- Responses are signed by the node's private key for end-to-end verification
+
+**Configuration:**
+
+```bash
+# Enable remote serial feature
+MCTOMQTT_REMOTE_SERIAL_ENABLED=true
+
+# Comma-separated list of companion public keys (64 hex chars each)
+# These are the devices authorized to send commands to this node
+MCTOMQTT_REMOTE_SERIAL_ALLOWED_COMPANIONS=03CEBEA...
+
+# Nonce TTL in seconds (default: 120) - how long to track nonces for replay protection
+MCTOMQTT_REMOTE_SERIAL_NONCE_TTL=120
+
+# Command timeout in seconds (default: 10) - how long to wait for serial response
+MCTOMQTT_REMOTE_SERIAL_COMMAND_TIMEOUT=10
+```
+
+**How it works:**
+1. You connect your companion device via Bluetooth to the Packet Analyzer web interface
+2. The browser uses the companion's private key to sign command JWTs
+3. Commands are sent via MQTT to your node's `serial/commands` topic
+4. This script verifies the JWT signature against the allowlist
+5. Valid commands are executed on the serial port
+6. Responses are signed and published to the `serial/responses` topic
+
+**Note:** Ensure your system clock is synchronized (NTP) for JWT expiry verification.
+
 ## Running the Script
 
 The installer offers three deployment options:
