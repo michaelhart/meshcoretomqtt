@@ -144,6 +144,7 @@ class MeshCoreBridge:
         # Remote serial configuration
         self.remote_serial_enabled = self.get_env_bool('REMOTE_SERIAL_ENABLED', False)
         self.remote_serial_allowed_companions = self._parse_allowed_companions()
+        self.remote_serial_disallowed_commands = self._parse_disallowed_commands()
         self.remote_serial_nonce_ttl = self.get_env_int('REMOTE_SERIAL_NONCE_TTL', 120)  # 2 minutes
         self.remote_serial_nonces = {}  # {nonce: timestamp} for replay protection
         self.remote_serial_command_timeout = self.get_env_int('REMOTE_SERIAL_COMMAND_TIMEOUT', 10)  # seconds
@@ -215,6 +216,33 @@ class MeshCoreBridge:
         if companions:
             logger.info(f"Remote serial enabled with {len(companions)} allowed companion(s)")
         return companions
+    
+    def _parse_disallowed_commands(self):
+        """Parse REMOTE_SERIAL_DISALLOWED_COMMANDS env var into a list of command prefixes"""
+        disallowed_str = self.get_env('REMOTE_SERIAL_DISALLOWED_COMMANDS', '')
+        
+        if not disallowed_str:
+            return []
+        
+        disallowed = []
+        for cmd in disallowed_str.split(','):
+            cmd = cmd.strip().lower()
+            if cmd:
+                disallowed.append(cmd)
+        
+        if disallowed:
+            logger.debug(f"Remote serial disallowed commands: {disallowed}")
+        return disallowed
+    
+    def _is_command_allowed(self, command):
+        """Check if a command is allowed (not in disallowed list)"""
+        cmd_lower = command.strip().lower()
+        
+        for disallowed in self.remote_serial_disallowed_commands:
+            if cmd_lower.startswith(disallowed):
+                return False, disallowed
+        
+        return True, None
     
     def resolve_topic_template(self, template, broker_num=None):
         """Resolve topic template with {IATA} and {PUBLIC_KEY} placeholders"""
@@ -966,6 +994,13 @@ class MeshCoreBridge:
         # Record nonce to prevent replay
         self.remote_serial_nonces[nonce] = current_time
         
+        # Check if command is disallowed
+        allowed, matched_rule = self._is_command_allowed(command)
+        if not allowed:
+            logger.warning(f"[SERIAL] Command blocked by rule '{matched_rule}': {command}")
+            self._publish_serial_response(command, nonce, False, f"Command blocked: {matched_rule}", broker_num)
+            return
+        
         # Execute the serial command
         logger.info(f"[SERIAL] Executing command from {companion_pubkey[:16]}...: {command}")
         success, response = self._execute_serial_command(command)
@@ -1608,6 +1643,8 @@ class MeshCoreBridge:
                     logger.debug(f"  Allowed companion: {pubkey[:16]}...")
             else:
                 logger.warning("Remote serial: ENABLED but no companions configured (will reject all commands)")
+            if self.remote_serial_disallowed_commands:
+                logger.info(f"Remote serial blocked commands: {self.remote_serial_disallowed_commands}")
         else:
             logger.info("Remote serial: DISABLED")
         
