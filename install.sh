@@ -156,7 +156,7 @@ prompt_iata_simple() {
     
     echo "" >&2
     print_info "IATA code is a 3-letter airport code identifying your region (e.g., SEA, LAX, NYC)" >&2
-    print_info "Search/view all IATA codes on a map: https://analyzer.letsme.sh/map/iata" >&2
+    print_info "Search/view all IATA codes on a map: https://analyzer.letsmesh.net/map/iata" >&2
     echo "" >&2
     
     while [ -z "$iata" ] || [ "$iata" = "XXX" ]; do
@@ -187,7 +187,7 @@ prompt_iata_letsmesh() {
     echo "" >&2
     print_info "Your IATA code identifies your geographic region (e.g., SEA, LAX, NYC, LON)" >&2
     print_info "Type to search by airport code or city name" >&2
-    print_info "View all IATA codes on a map: https://analyzer.letsme.sh/map/iata" >&2
+    print_info "View all IATA codes on a map: https://analyzer.letsmesh.net/map/iata" >&2
     echo "" >&2
     
     while [ -z "$selected_iata" ]; do
