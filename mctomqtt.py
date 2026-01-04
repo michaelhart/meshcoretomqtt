@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-__version__ = "1.0.7.0-alpha1a"
+__version__ = "1.0.7.0"
 
 import sys
 import os
